@@ -30,8 +30,6 @@ export default defineConfig(({ mode }) => {
         mode: "smart",
       },
 
-      // No custom CPU limit: use Cloudflare Fre defaults.
-
       observability: {
         enabled: true,
 
@@ -46,6 +44,6 @@ export default defineConfig(({ mode }) => {
           headSamplingRate: 0.05,
         },
       },
-    } satisfies CloudflareConfig;
-  };
+    },
+  } satisfies CloudflareConfig;
 });
