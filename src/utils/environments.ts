@@ -1,0 +1,182 @@
+import { AsyncLocalStorage } from "node:async_hooks";
+import * as process from "node:process";
+
+const requestEnvironment = new AsyncLocalStorage<Env | Partial<Env>>();
+
+type ParsedEnvironmentValue = string | Array<unknown> | object | undefined;
+
+// Only an explicit JSON array or object carries structure: an array configures
+// multiple credentials and an object configures named credential profiles.
+const STRUCTURED_JSON_PATTERN = /^\s*[[{]/;
+
+// Bindings are immutable for one deployed Env object. Keying by that object
+// and setting name avoids retaining credential text as a Map key.
+const parsedValueCache = new WeakMap<
+  Env | Partial<Env>,
+  Map<keyof Env, ParsedEnvironmentValue>
+>();
+
+/**
+ * Utility class for accessing and manipulating environment variables
+ * in a type-safe way with parsing capabilities.
+ *
+ * @class Environments
+ */
+export class Environments {
+  // Retained as a fallback for local tooling and callers that explicitly set an
+  // environment outside a request. Worker requests use requestEnvironment so
+  // concurrent requests cannot overwrite each other's bindings.
+  private static currentEnv: Env | undefined;
+
+  /**
+   * Runs a callback with an environment isolated to its asynchronous request
+   * context.
+   */
+  static run<T>(env: Env, callback: () => T): T {
+    return requestEnvironment.run(env, callback);
+  }
+
+  /**
+   * Install operator configuration for Node-based deployment tooling. Config
+   * values are serialized exactly as Worker secret bindings would be.
+   */
+  static runWithConfig<T>(
+    config: Record<string, unknown>,
+    callback: () => T,
+  ): T {
+    const serializedConfig = Object.fromEntries(
+      Object.entries(config)
+        .filter(([key, value]) => key !== "$schema" && value != null)
+        .map(([key, value]) => [
+          key,
+          typeof value === "object" ? JSON.stringify(value) : String(value),
+        ]),
+    ) as Partial<Env>;
+    return requestEnvironment.run(serializedConfig, callback);
+  }
+
+  /**
+   * Sets the current environment object.
+   *
+   * @param {Env} env - The environment object from Cloudflare Workers
+   */
+  static setEnv(env: Env | undefined): void {
+    this.currentEnv = env;
+  }
+
+  /**
+   * Gets the current environment object.
+   *
+   * @returns {Env | undefined} The current environment object
+   */
+  static getEnv(): Env | Partial<Env> | undefined {
+    return requestEnvironment.getStore() ?? this.currentEnv;
+  }
+
+  /**
+   * Returns all environment variables cast as the Env type.
+   *
+   * @returns {Env} All environment variables
+   */
+  static all(): Env {
+    // Node's ProcessEnv cannot describe generated Workers bindings, but this
+    // fallback is only used by local tooling before a Worker Env is installed.
+    const environment = this.getEnv();
+    return environment ? (environment as Env) : (process.env as unknown as Env);
+  }
+
+  /**
+   * Checks if an environment variable exists.
+   *
+   * @param {keyof Env} key - The environment variable key to check
+   * @returns {boolean} True if the environment variable exists, false otherwise
+   */
+  static has(key: keyof Env): key is keyof Env {
+    const env = this.all();
+    return env[key] !== undefined;
+  }
+
+  /**
+   * Gets a specific environment variable by key and returns it as a string.
+   *
+   * @param {keyof Env} key - The environment variable key to retrieve
+   * @param {false} parse - Set to false to prevent parsing and return the raw string
+   * @returns {string | undefined} The environment variable value as a string, or undefined if not found
+   */
+  static get(key: keyof Env, parse: false): string | undefined;
+
+  /**
+   * Gets a specific environment variable by key and parses it as structured
+   * JSON. Anything that is not an explicit JSON array or object is returned
+   * unchanged, so a credential is never split or coerced: multiple values are
+   * configured explicitly as a JSON array and profiles as a JSON object.
+   *
+   * @param {keyof Env} key - The environment variable key to retrieve
+   * @param {boolean} [parse=true] - Whether to parse the value
+   * @returns {string | Array<unknown> | Object | undefined} The environment variable value,
+   * parsed according to the parse parameter
+   */
+  static get(
+    key: keyof Env,
+    parse?: boolean,
+  ): string | Array<unknown> | object | undefined;
+
+  static get(
+    key: keyof Env,
+    parse: boolean = true,
+  ): string | Array<unknown> | object | undefined {
+    const env = this.all();
+    const configuredValue = env[key] as string | undefined;
+
+    if (configuredValue === undefined) {
+      return undefined;
+    }
+
+    if (!parse) {
+      return configuredValue;
+    }
+
+    let environmentCache = parsedValueCache.get(env);
+    if (environmentCache?.has(key)) {
+      return environmentCache.get(key);
+    }
+
+    // Anything that is not structured JSON is a single opaque secret. It must
+    // not be split on any separator (provider credentials legitimately contain
+    // commas) and must not be coerced to another JSON type: a credential such
+    // as "12345" or "true" would otherwise parse to a number or boolean, which
+    // the credential readers discard, silently disabling a configured provider.
+    const jsonValue = this.parseStructuredJson(configuredValue);
+    const parsedValue = jsonValue !== undefined ? jsonValue : configuredValue;
+
+    if (!environmentCache) {
+      environmentCache = new Map();
+      parsedValueCache.set(env, environmentCache);
+    }
+    environmentCache.set(key, parsedValue);
+    return parsedValue;
+  }
+
+  /**
+   * Attempts to parse a string as a JSON array or object.
+   *
+   * @private
+   * @param {string} value - The string to parse
+   * @returns {Array<unknown> | Object | undefined} The parsed JSON array or
+   * object, or undefined when the value is not one
+   */
+  private static parseStructuredJson(
+    value: string,
+  ): Array<unknown> | object | undefined {
+    if (!STRUCTURED_JSON_PATTERN.test(value)) {
+      return undefined;
+    }
+    try {
+      // A leading `[` or `{` can only begin an array or an object, so a
+      // successful parse never yields a scalar here.
+      return JSON.parse(value) as Array<unknown> | object;
+    } catch {
+      return undefined;
+    }
+  }
+}
