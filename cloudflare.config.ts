@@ -30,7 +30,7 @@ export default defineConfig(({ mode }) => {
         mode: "smart",
       },
 
-      // No custom CPU limit: use Cloudflare Free defaults.
+      // No custom CPU limit: use Cloudflare Fre defaults.
 
       observability: {
         enabled: true,
